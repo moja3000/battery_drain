@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>Ultimate Battery Burner</title>
+  <title>iPad Battery Burner</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <style>
     html, body {
@@ -10,14 +10,16 @@
       padding: 0;
       background: #000;
       font-family: ui-monospace, system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
-      overflow: hidden; /* 스크롤 방지 */
+    }
+    .section {
+      height: 100vh;
     }
     .canvas-section {
       height: 100vh;
-      width: 100vw;
       position: relative;
-      background: #020202;
+      background: #000;
       color: #0f0;
+      font-family: ui-monospace,monospace;
       overflow: hidden;
     }
     canvas {
@@ -27,250 +29,351 @@
       height: 100%;
       display: block;
     }
-    /* 눈에 거슬리지 않도록 아주 어둡게 설정 */
-    #glCanvas { opacity: 0.8; }
-    
-    .status-panel {
+    .diag {
       position: absolute;
       top: 1rem;
       left: 1rem;
-      background: rgba(0,0,0,0.7);
-      padding: 1rem;
-      border-radius: 8px;
-      border: 1px solid #333;
-      color: #44ff44;
-      font-size: 12px;
-      line-height: 1.5;
-      pointer-events: none;
-      z-index: 10;
+      background: rgba(0,0,0,0.65);
+      padding: 0.8rem 1rem;
+      border-radius: 0.5rem;
+      font-size: 0.85rem;
+      line-height: 1.35;
+      color: #9fffb8;
+      white-space: pre-line;
     }
-    .warning {
-      color: #ff4444;
-      font-weight: bold;
-      margin-bottom: 0.5rem;
+    .overlay {
+      position: absolute;
+      bottom: 0.7rem;
+      right: 1rem;
+      font-family: ui-monospace,monospace;
+      font-size: 0.9rem;
+      color: rgba(0,255,180,0.85);
+      background: rgba(0,0,0,0.45);
+      padding: 0.3rem 0.6rem;
+      border-radius: 0.4rem;
+      user-select: none;
     }
   </style>
 </head>
 <body>
 
+  <div class="section"></div>
+  <div class="section"></div>
+
   <div class="canvas-section">
     <canvas id="c2d"></canvas>
     <canvas id="glCanvas"></canvas>
-    
-    <div class="status-panel" id="statusPanel">
-      <div class="warning">⚠️ BATTERY DRAINER ACTIVE</div>
-      <div id="stats">Initializing...</div>
-    </div>
+
+    <div class="diag" id="diagBox"></div>
+    <div class="overlay" id="overlayBox"></div>
   </div>
 
   <script>
-    // ===== Configuration =====
-    // 화면에 티가 안 나게 하려면 값을 낮추세요. 배터리는 1.0이 제일 빠릅니다.
-    // 0.005 정도면 거의 검은색으로 보이지만 GPU는 풀가동합니다.
-    const VISUAL_INTENSITY = 0.005; 
-    
-    let running = true;
-    let frameCount = 0;
+    // ===== Runtime state =====
+    let running = false;
+    let started = false;
+    let fps = 0, last = 0, rafId = 0;
+    let gpuLoad = 0;
     let workerCount = 0;
-    let networkReqs = 0;
 
-    const statsEl = document.getElementById('stats');
+    const POINT_SIZE = 10.0;
+    const SPHERE_DIV = 360;
 
-    // ===== 1. Network Burner (통신 모듈 활성화 유지) =====
-    // 지속적인 요청을 통해 Wifi/LTE 칩셋이 Low power mode로 가는 것을 방지
-    function startNetworkBurner() {
-      const burnNetwork = () => {
-        if (!running) return;
-        // 캐시 방지를 위해 랜덤 쿼리 스트링 사용
-        // 자신의 페이지를 호출하거나 가벼운 리소스를 호출
-        fetch(window.location.href + '?cache_bust=' + Math.random())
-          .then(() => { networkReqs++; })
-          .catch(() => {}) // 에러 무시
-          .finally(() => {
-             // 너무 빠르면 브라우저가 차단하므로 약간의 텀을 둠
-             setTimeout(burnNetwork, 200); 
-          });
-      };
-      // 병렬로 3개의 스트림 실행
-      for(let i=0; i<3; i++) burnNetwork();
-    }
+    const diag = {
+      glOK: false,
+      canvasW: 0,
+      canvasH: 0,
+      rafTicks: 0,
+      verts: 0,
+      pointSize: POINT_SIZE
+    };
 
-    // ===== 2. CPU/Memory Workers (ALU + RAM Load) =====
+    let diagBox, overlayBox;
+
+    // ===== CPU Workers (안정 고부하) =====
     let workers = [];
-    function startCPU() {
-      const coreCount = navigator.hardwareConcurrency || 4;
-      // 효율 코어와 성능 코어를 모두 쓰기 위해 코어 수보다 많이 할당
-      const threadCount = Math.min(16, coreCount * 2); 
-
-      const workerCode = `
-        onmessage = function() {
-          let running = true;
-          // 메모리 부하를 위한 큰 배열 (GC 유도)
-          let heavyArray = [];
-          
-          function run() {
-            // 1. 실수 연산 부하
-            let a = 1.1, b = 2.2, c = 3.3;
-            for(let i=0; i<50000; i++) {
-              a = Math.sin(b * c + a);
-              b = Math.cos(a * c + b);
-              c = Math.tan(a * b + c);
+    function makeWorker() {
+      const code = `
+        // branch-light, transcendental-heavy loop
+        let stop=false;
+        onmessage=(e)=>{if(e.data==='stop')stop=true;};
+        function spin(){
+          let a=0.123456789, b=0.987654321, c=1.41421356237;
+          const f=(x)=>Math.tan(Math.sin(x)*1.618)+Math.sqrt(Math.abs(x%131071));
+          while(!stop){
+            // 1e7 정도가 iPad에서 "계속 바쁘지만 엔진 스로틀 최저화"에 적당
+            for(let i=0;i<1e7;i++){
+              a = f(b*c + i*0.000001);
+              b = f(a*c + i*0.000002);
+              c = f(a*b + i*0.000003);
             }
-            
-            // 2. 메모리 할당/해제 부하 (RAM 전력 소모)
-            if (Math.random() > 0.95) {
-              heavyArray = new Float32Array(1024 * 1024); // 4MB 할당
-              for(let k=0; k<100; k++) heavyArray[k] = Math.random(); // 접근
-            } else if (Math.random() > 0.95) {
-              heavyArray = []; // 해제
-            }
-
-            if(running) setTimeout(run, 0);
           }
-          run();
-        };
+        }
+        spin();
       `;
-
-      const blob = new Blob([workerCode], {type: 'application/javascript'});
-      const url = URL.createObjectURL(blob);
-
-      for(let i=0; i<threadCount; i++) {
-        const w = new Worker(url);
-        w.postMessage('start');
-        workers.push(w);
-      }
+      return new Worker(URL.createObjectURL(new Blob([code], { type: "application/javascript" })));
+    }
+    function startCPU() {
+      stopCPU();
+      const nHw = Math.max(2, navigator.hardwareConcurrency || 6);
+      const n = Math.min(12, Math.ceil(nHw * 1.5)); // 코어수×1.5 (상한 12)
+      for (let i = 0; i < n; i++) workers.push(makeWorker());
       workerCount = workers.length;
     }
+    function stopCPU() {
+      for (const w of workers) { try{ w.postMessage('stop'); w.terminate(); }catch(e){} }
+      workers = [];
+      workerCount = 0;
+    }
 
-    // ===== 3. WebGL High-Load Shader (GPU Burner) =====
+    // ===== Canvas2D (백버퍼/대역폭 부하) =====
+    let c2d, ctx;
+    let particles = [];
+    function init2D() {
+      ctx = c2d.getContext('2d', { alpha: false });
+      const w = c2d.width, h = c2d.height;
+      const N = 2500;
+      particles = Array.from({length: N}, () => ({
+        x: Math.random()*w, y: Math.random()*h,
+        vx: (Math.random()-0.5)*2.0, vy: (Math.random()-0.5)*2.0
+      }));
+    }
+    function draw2D() {
+      const w = c2d.width, h = c2d.height;
+      ctx.fillStyle = "rgb(0,0,0)";
+      ctx.fillRect(0,0,w,h);
+      ctx.globalAlpha = 0.04;
+      ctx.fillStyle = "#020202";
+      for (const p of particles) {
+        p.x += p.vx; p.y += p.vy;
+        if (p.x<0 || p.x>w) p.vx *= -1;
+        if (p.y<0 || p.y>h) p.vy *= -1;
+        ctx.fillRect(p.x, p.y, 2, 2);
+      }
+      ctx.globalAlpha = 1.0;
+    }
+
+    // ===== WebGL (안정형 full-screen heavy shader + multi-pass) =====
+    let glCanvas, gl, prog, vbo;
+    let numVerts = 0;
+    let isGL2 = true;
+
+    function makeSphere(div = SPHERE_DIV){
+      const verts = [];
+      for(let i=0;i<=div;i++){
+        const th = i*Math.PI/div;
+        for(let j=0;j<=div;j++){
+          const ph = j*2*Math.PI/div;
+          const x = Math.sin(th)*Math.cos(ph);
+          const y = Math.cos(th);
+          const z = Math.sin(th)*Math.sin(ph);
+          verts.push(x,y,z);
+        }
+      }
+      numVerts = verts.length/3;
+      diag.verts = numVerts;
+      return new Float32Array(verts);
+    }
+
     function initGL() {
-      const canvas = document.getElementById('glCanvas');
-      // 픽셀 수를 늘리기 위해 DPR을 강제로 높임 (최대 3)
-      const dpr = Math.min(window.devicePixelRatio || 1, 3);
-      canvas.width = window.innerWidth * dpr;
-      canvas.height = window.innerHeight * dpr;
-      
-      const gl = canvas.getContext('webgl2', { 
-        powerPreference: 'high-performance',
-        antialias: false,
-        alpha: false 
-      });
+      gl = glCanvas.getContext("webgl2", { antialias:true, powerPreference:"high-performance", alpha:false })
+        || glCanvas.getContext("webgl", { antialias:true, alpha:false });
 
-      if(!gl) return;
+      if (!gl) {
+        diag.glOK = false;
+        console.warn("WebGL init failed");
+        return;
+      }
+      isGL2 = !!gl.drawArraysInstanced;
 
-      const vsSource = `#version 300 es
-        in vec4 position;
-        void main() { gl_Position = position; }
-      `;
-
-      // 컴파일러 최적화 방지 로직이 포함된 쉐이더
-      // 결과값(color)을 최종 출력(fragColor)에 반영해야 GPU가 일을 함
-      const fsSource = `#version 300 es
+      const vert2 = `#version 300 es
+        in vec2 p;
+        void main(){ gl_Position = vec4(p,0.0,1.0); }`;
+      const frag2 = `#version 300 es
         precision highp float;
-        uniform float time;
-        uniform vec2 resolution;
-        out vec4 fragColor;
-
-        void main() {
-          vec2 uv = gl_FragCoord.xy / resolution.xy;
-          vec3 color = vec3(0.0);
-          
-          // 무거운 반복 연산
-          float s = 0.0;
-          for(float i=0.0; i<400.0; i++) {
-            // 복잡한 삼각함수와 노이즈 연산
-            vec2 p = uv * (10.0 + i * 0.01) + time * 0.1;
-            s += cos(p.x * p.y + time) * sin(p.x * 2.0);
-            s += sqrt(abs(sin(p.y * 3.14)));
+        uniform float uT;
+        out vec4 C;
+        float h(vec2 p){ return fract(sin(dot(p, vec2(12.9898,78.233))) * 43758.5453); }
+        float n(vec2 p){
+          float s=0.0, a=0.5;
+          for(int i=0;i<9;i++){ s += h(p)*a; p*=2.03; a*=0.5; }
+          return s;
+        }
+        void main(){
+          vec3 col = vec3(0.1);
+          for (int i=0;i<900; i++){
+            float t = uT*0.0008 + float(i)*0.03125;
+            col = abs(cos(col*t + vec3(n(gl_FragCoord.xy+t),
+                                       n(gl_FragCoord.yx-t),
+                                       n(gl_FragCoord.yy+ t))));
           }
-          
-          // 중요: 계산된 s값을 색상에 반영해야 함. 
-          // 0.0을 곱하면 컴파일러가 루프를 삭제할 수 있음.
-          // 아주 작은 값(0.001)을 곱해 눈에는 검게 보이지만 연산은 수행되게 함.
-          color = vec3(s) * ${VISUAL_INTENSITY}; 
-          
-          fragColor = vec4(color, 1.0);
-        }
-      `;
+          C = vec4(0.0,0.0,0.0,1.0);
+        }`;
 
-      function createShader(gl, type, source) {
-        const shader = gl.createShader(type);
-        gl.shaderSource(shader, source);
-        gl.compileShader(shader);
-        if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
-          console.error(gl.getShaderInfoLog(shader));
-          return null;
+      const vert1 = isGL2 ? vert2 : `
+        attribute vec2 p;
+        void main(){ gl_Position = vec4(p,0.0,1.0); }`;
+      const frag1 = isGL2 ? frag2 : `
+        precision highp float;
+        uniform float uT;
+        float h(vec2 p){ return fract(sin(dot(p, vec2(12.9898,78.233))) * 43758.5453); }
+        float n(vec2 p){
+          float s=0.0, a=0.5;
+          for(int i=0;i<7;i++){ s += h(p)*a; p*=2.03; a*=0.5; }
+          return s;
         }
-        return shader;
+        void main(){
+          vec3 col = vec3(0.1);
+          for (int i=0;i<750; i++){
+            float t = uT*0.0008 + float(i)*0.03125;
+            col = abs(cos(col*t + vec3(n(gl_FragCoord.xy+t),
+                                       n(gl_FragCoord.yx-t),
+                                       n(gl_FragCoord.yy+ t))));
+          }
+          gl_FragColor = vec4(0.0,0.0,0.0,1.0);
+        }`;
+
+      function compile(src, type){
+        const s = gl.createShader(type);
+        gl.shaderSource(s, src);
+        gl.compileShader(s);
+        if(!gl.getShaderParameter(s, gl.COMPILE_STATUS)){
+          console.error(gl.getShaderInfoLog(s));
+        }
+        return s;
+      }
+      const vs = compile(vert1, gl.VERTEX_SHADER);
+      const fs = compile(frag1, gl.FRAGMENT_SHADER);
+      prog = gl.createProgram();
+      gl.attachShader(prog, vs);
+      gl.attachShader(prog, fs);
+      gl.linkProgram(prog);
+      if(!gl.getProgramParameter(prog, gl.LINK_STATUS)){
+        console.error(gl.getProgramInfoLog(prog));
       }
 
-      const program = gl.createProgram();
-      gl.attachShader(program, createShader(gl, gl.VERTEX_SHADER, vsSource));
-      gl.attachShader(program, createShader(gl, gl.FRAGMENT_SHADER, fsSource));
-      gl.linkProgram(program);
-      gl.useProgram(program);
+      const quad = new Float32Array([-1,-1,  1,-1,  -1,1,   -1,1,  1,-1,  1,1]);
+      vbo = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+      gl.bufferData(gl.ARRAY_BUFFER, quad, gl.STATIC_DRAW);
 
-      // Full screen quad
-      const vertices = new Float32Array([-1,-1, 1,-1, -1,1, 1,1]);
-      const buffer = gl.createBuffer();
-      gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
-      gl.bufferData(gl.ARRAY_BUFFER, vertices, gl.STATIC_DRAW);
+      const loc = gl.getAttribLocation(prog, "p");
+      gl.enableVertexAttribArray(loc);
+      gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
 
-      const posLoc = gl.getAttribLocation(program, 'position');
-      gl.enableVertexAttribArray(posLoc);
-      gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0);
+      // sphere 데이터는 실제 화면에는 안 보이지만 부하를 늘리기 위한 준비용
+      const vbo2 = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, vbo2);
+      gl.bufferData(gl.ARRAY_BUFFER, makeSphere(), gl.STATIC_DRAW);
 
-      const timeLoc = gl.getUniformLocation(program, 'time');
-      const resLoc = gl.getUniformLocation(program, 'resolution');
+      diag.glOK = true;
+    }
 
-      function render(now) {
-        if(!running) return;
-        gl.viewport(0, 0, canvas.width, canvas.height);
-        gl.uniform1f(timeLoc, now * 0.001);
-        gl.uniform2f(resLoc, canvas.width, canvas.height);
-        
-        // 드로우 콜을 여러번 호출하여 부하 가중
-        for(let i=0; i<5; i++) {
-           gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-        }
-        
-        frameCount++;
-        requestAnimationFrame(render);
+    function drawGL(t){
+      if (!gl) return;
+      const w = glCanvas.width, h = glCanvas.height;
+      gl.viewport(0,0,w,h);
+      gl.enable(gl.DEPTH_TEST);
+      gl.clearColor(0,0,0,1);
+      gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+      gl.useProgram(prog);
+      const uT = gl.getUniformLocation(prog,"uT");
+      gl.uniform1f(uT, t);
+
+      // 메인 패스 8회
+      for (let k=0; k<8; k++){
+        gl.drawArrays(gl.TRIANGLES, 0, 6);
       }
-      requestAnimationFrame(render);
     }
 
-    // ===== 4. Overlay Update =====
-    function updateStats() {
-      const mem = performance.memory ? Math.round(performance.memory.usedJSHeapSize/1024/1024) : 'N/A';
-      statsEl.innerHTML = `
-        Time: ${new Date().toLocaleTimeString()}<br>
-        Threads: ${workerCount} Active<br>
-        Frames: ${frameCount}<br>
-        Network Reqs: ${networkReqs}<br>
-        Resolution: ${window.innerWidth}x${window.innerHeight}<br>
-        <br>
-        <span style="color:#aaa">Tip: Increase screen brightness<br>for max drain.</span>
-      `;
-      setTimeout(updateStats, 1000);
+    // ===== Loop & overlay =====
+    function updateOverlay(dt){
+      fps = Math.max(1, Math.round(1000/Math.max(1, dt)));
+      gpuLoad = Math.min(100, Math.round(100 * (1 - Math.exp(-dt / 6))));
+      const text = `FPS ${fps} | GPU ~${gpuLoad}%`;
+      if (overlayBox) overlayBox.textContent = text;
+
+      const diagLines = [
+        `GL OK: ${diag.glOK ? 'yes' : 'no'}`,
+        `Canvas(px): ${diag.canvasW}×${diag.canvasH}`,
+        `Workers: ${workerCount}`,
+        `RAF ticks: ${diag.rafTicks}`,
+        `Verts (seed): ${diag.verts}`,
+        `PointSize: ${diag.pointSize}`
+      ];
+      if (diagBox) diagBox.textContent = diagLines.join('\n');
     }
 
-    // ===== Init =====
-    window.onload = () => {
-      // 사용자 인터랙션이 없어도 자동 시작되도록 구성했으나,
-      // 일부 브라우저는 오디오 컨텍스트 등에서 클릭을 요구할 수 있음.
-      // 현재 코드는 순수 연산이라 바로 시작됨.
+    function loop(ts){
+      const dt = ts - last; last = ts;
+      draw2D();
+      drawGL(ts);
+      updateOverlay(dt);
+      diag.rafTicks++;
+
+      rafId = requestAnimationFrame(loop);
+      setTimeout(() => { drawGL(ts + 0.5); }, 0);
+    }
+
+    function startAll(){
+      if (running) return;
+      running = true;
       startCPU();
-      // startNetworkBurner();
+      init2D();
       initGL();
-      updateStats();
-    };
+      last = performance.now();
+      rafId = requestAnimationFrame(loop);
+    }
 
-    window.onresize = () => {
-      // 리사이즈 시 페이지 리로드로 캔버스 재설정
-      window.location.reload();
-    };
+    function stopAll(){
+      running = false;
+      stopCPU();
+      cancelAnimationFrame(rafId);
+    }
 
+    function setHiDPISize(el){
+      const base = window.devicePixelRatio || 1;
+      const dpr = Math.min(5, Math.max(2.5, base * 2)); // 안정 고해상도
+      el.width = Math.floor(window.innerWidth * dpr);
+      el.height = Math.floor(window.innerHeight * dpr);
+      diag.canvasW = el.width;
+      diag.canvasH = el.height;
+      el.style.width = "100%";
+      el.style.height = "100%";
+    }
+
+    document.addEventListener('DOMContentLoaded', () => {
+      c2d = document.getElementById('c2d');
+      glCanvas = document.getElementById('glCanvas');
+      diagBox = document.getElementById('diagBox');
+      overlayBox = document.getElementById('overlayBox');
+
+      function resize(){
+        setHiDPISize(c2d);
+        setHiDPISize(glCanvas);
+      }
+      resize();
+      window.addEventListener('resize', resize);
+
+      // IntersectionObserver로 “스크롤해서 내려갔을 때” 시작
+      setTimeout(() => {
+        const observer = new IntersectionObserver((entries) => {
+          entries.forEach(e => {
+            if (e.isIntersecting && !started){
+              started = true;
+              startAll();
+            }
+          });
+        }, { threshold: 0.2 });
+        if (glCanvas) observer.observe(glCanvas);
+      }, 200);
+
+      // 페이지 떠날 때 정리
+      window.addEventListener('beforeunload', () => {
+        stopAll();
+      });
+    });
   </script>
 </body>
 </html>
