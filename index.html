@@ -1,0 +1,379 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>iPad Battery Burner</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: #000;
+      font-family: ui-monospace, system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+    }
+    .section {
+      height: 100vh;
+    }
+    .canvas-section {
+      height: 100vh;
+      position: relative;
+      background: #000;
+      color: #0f0;
+      font-family: ui-monospace,monospace;
+      overflow: hidden;
+    }
+    canvas {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+    .diag {
+      position: absolute;
+      top: 1rem;
+      left: 1rem;
+      background: rgba(0,0,0,0.65);
+      padding: 0.8rem 1rem;
+      border-radius: 0.5rem;
+      font-size: 0.85rem;
+      line-height: 1.35;
+      color: #9fffb8;
+      white-space: pre-line;
+    }
+    .overlay {
+      position: absolute;
+      bottom: 0.7rem;
+      right: 1rem;
+      font-family: ui-monospace,monospace;
+      font-size: 0.9rem;
+      color: rgba(0,255,180,0.85);
+      background: rgba(0,0,0,0.45);
+      padding: 0.3rem 0.6rem;
+      border-radius: 0.4rem;
+      user-select: none;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="section"></div>
+  <div class="section"></div>
+
+  <div class="canvas-section">
+    <canvas id="c2d"></canvas>
+    <canvas id="glCanvas"></canvas>
+
+    <div class="diag" id="diagBox"></div>
+    <div class="overlay" id="overlayBox"></div>
+  </div>
+
+  <script>
+    // ===== Runtime state =====
+    let running = false;
+    let started = false;
+    let fps = 0, last = 0, rafId = 0;
+    let gpuLoad = 0;
+    let workerCount = 0;
+
+    const POINT_SIZE = 10.0;
+    const SPHERE_DIV = 360;
+
+    const diag = {
+      glOK: false,
+      canvasW: 0,
+      canvasH: 0,
+      rafTicks: 0,
+      verts: 0,
+      pointSize: POINT_SIZE
+    };
+
+    let diagBox, overlayBox;
+
+    // ===== CPU Workers (안정 고부하) =====
+    let workers = [];
+    function makeWorker() {
+      const code = `
+        // branch-light, transcendental-heavy loop
+        let stop=false;
+        onmessage=(e)=>{if(e.data==='stop')stop=true;};
+        function spin(){
+          let a=0.123456789, b=0.987654321, c=1.41421356237;
+          const f=(x)=>Math.tan(Math.sin(x)*1.618)+Math.sqrt(Math.abs(x%131071));
+          while(!stop){
+            // 1e7 정도가 iPad에서 "계속 바쁘지만 엔진 스로틀 최저화"에 적당
+            for(let i=0;i<1e7;i++){
+              a = f(b*c + i*0.000001);
+              b = f(a*c + i*0.000002);
+              c = f(a*b + i*0.000003);
+            }
+          }
+        }
+        spin();
+      `;
+      return new Worker(URL.createObjectURL(new Blob([code], { type: "application/javascript" })));
+    }
+    function startCPU() {
+      stopCPU();
+      const nHw = Math.max(2, navigator.hardwareConcurrency || 6);
+      const n = Math.min(12, Math.ceil(nHw * 1.5)); // 코어수×1.5 (상한 12)
+      for (let i = 0; i < n; i++) workers.push(makeWorker());
+      workerCount = workers.length;
+    }
+    function stopCPU() {
+      for (const w of workers) { try{ w.postMessage('stop'); w.terminate(); }catch(e){} }
+      workers = [];
+      workerCount = 0;
+    }
+
+    // ===== Canvas2D (백버퍼/대역폭 부하) =====
+    let c2d, ctx;
+    let particles = [];
+    function init2D() {
+      ctx = c2d.getContext('2d', { alpha: false });
+      const w = c2d.width, h = c2d.height;
+      const N = 2500;
+      particles = Array.from({length: N}, () => ({
+        x: Math.random()*w, y: Math.random()*h,
+        vx: (Math.random()-0.5)*2.0, vy: (Math.random()-0.5)*2.0
+      }));
+    }
+    function draw2D() {
+      const w = c2d.width, h = c2d.height;
+      ctx.fillStyle = "rgb(0,0,0)";
+      ctx.fillRect(0,0,w,h);
+      ctx.globalAlpha = 0.04;
+      ctx.fillStyle = "#020202";
+      for (const p of particles) {
+        p.x += p.vx; p.y += p.vy;
+        if (p.x<0 || p.x>w) p.vx *= -1;
+        if (p.y<0 || p.y>h) p.vy *= -1;
+        ctx.fillRect(p.x, p.y, 2, 2);
+      }
+      ctx.globalAlpha = 1.0;
+    }
+
+    // ===== WebGL (안정형 full-screen heavy shader + multi-pass) =====
+    let glCanvas, gl, prog, vbo;
+    let numVerts = 0;
+    let isGL2 = true;
+
+    function makeSphere(div = SPHERE_DIV){
+      const verts = [];
+      for(let i=0;i<=div;i++){
+        const th = i*Math.PI/div;
+        for(let j=0;j<=div;j++){
+          const ph = j*2*Math.PI/div;
+          const x = Math.sin(th)*Math.cos(ph);
+          const y = Math.cos(th);
+          const z = Math.sin(th)*Math.sin(ph);
+          verts.push(x,y,z);
+        }
+      }
+      numVerts = verts.length/3;
+      diag.verts = numVerts;
+      return new Float32Array(verts);
+    }
+
+    function initGL() {
+      gl = glCanvas.getContext("webgl2", { antialias:true, powerPreference:"high-performance", alpha:false })
+        || glCanvas.getContext("webgl", { antialias:true, alpha:false });
+
+      if (!gl) {
+        diag.glOK = false;
+        console.warn("WebGL init failed");
+        return;
+      }
+      isGL2 = !!gl.drawArraysInstanced;
+
+      const vert2 = `#version 300 es
+        in vec2 p;
+        void main(){ gl_Position = vec4(p,0.0,1.0); }`;
+      const frag2 = `#version 300 es
+        precision highp float;
+        uniform float uT;
+        out vec4 C;
+        float h(vec2 p){ return fract(sin(dot(p, vec2(12.9898,78.233))) * 43758.5453); }
+        float n(vec2 p){
+          float s=0.0, a=0.5;
+          for(int i=0;i<9;i++){ s += h(p)*a; p*=2.03; a*=0.5; }
+          return s;
+        }
+        void main(){
+          vec3 col = vec3(0.1);
+          for (int i=0;i<900; i++){
+            float t = uT*0.0008 + float(i)*0.03125;
+            col = abs(cos(col*t + vec3(n(gl_FragCoord.xy+t),
+                                       n(gl_FragCoord.yx-t),
+                                       n(gl_FragCoord.yy+ t))));
+          }
+          C = vec4(0.0,0.0,0.0,1.0);
+        }`;
+
+      const vert1 = isGL2 ? vert2 : `
+        attribute vec2 p;
+        void main(){ gl_Position = vec4(p,0.0,1.0); }`;
+      const frag1 = isGL2 ? frag2 : `
+        precision highp float;
+        uniform float uT;
+        float h(vec2 p){ return fract(sin(dot(p, vec2(12.9898,78.233))) * 43758.5453); }
+        float n(vec2 p){
+          float s=0.0, a=0.5;
+          for(int i=0;i<7;i++){ s += h(p)*a; p*=2.03; a*=0.5; }
+          return s;
+        }
+        void main(){
+          vec3 col = vec3(0.1);
+          for (int i=0;i<750; i++){
+            float t = uT*0.0008 + float(i)*0.03125;
+            col = abs(cos(col*t + vec3(n(gl_FragCoord.xy+t),
+                                       n(gl_FragCoord.yx-t),
+                                       n(gl_FragCoord.yy+ t))));
+          }
+          gl_FragColor = vec4(0.0,0.0,0.0,1.0);
+        }`;
+
+      function compile(src, type){
+        const s = gl.createShader(type);
+        gl.shaderSource(s, src);
+        gl.compileShader(s);
+        if(!gl.getShaderParameter(s, gl.COMPILE_STATUS)){
+          console.error(gl.getShaderInfoLog(s));
+        }
+        return s;
+      }
+      const vs = compile(vert1, gl.VERTEX_SHADER);
+      const fs = compile(frag1, gl.FRAGMENT_SHADER);
+      prog = gl.createProgram();
+      gl.attachShader(prog, vs);
+      gl.attachShader(prog, fs);
+      gl.linkProgram(prog);
+      if(!gl.getProgramParameter(prog, gl.LINK_STATUS)){
+        console.error(gl.getProgramInfoLog(prog));
+      }
+
+      const quad = new Float32Array([-1,-1,  1,-1,  -1,1,   -1,1,  1,-1,  1,1]);
+      vbo = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+      gl.bufferData(gl.ARRAY_BUFFER, quad, gl.STATIC_DRAW);
+
+      const loc = gl.getAttribLocation(prog, "p");
+      gl.enableVertexAttribArray(loc);
+      gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+
+      // sphere 데이터는 실제 화면에는 안 보이지만 부하를 늘리기 위한 준비용
+      const vbo2 = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, vbo2);
+      gl.bufferData(gl.ARRAY_BUFFER, makeSphere(), gl.STATIC_DRAW);
+
+      diag.glOK = true;
+    }
+
+    function drawGL(t){
+      if (!gl) return;
+      const w = glCanvas.width, h = glCanvas.height;
+      gl.viewport(0,0,w,h);
+      gl.enable(gl.DEPTH_TEST);
+      gl.clearColor(0,0,0,1);
+      gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+      gl.useProgram(prog);
+      const uT = gl.getUniformLocation(prog,"uT");
+      gl.uniform1f(uT, t);
+
+      // 메인 패스 8회
+      for (let k=0; k<8; k++){
+        gl.drawArrays(gl.TRIANGLES, 0, 6);
+      }
+    }
+
+    // ===== Loop & overlay =====
+    function updateOverlay(dt){
+      fps = Math.max(1, Math.round(1000/Math.max(1, dt)));
+      gpuLoad = Math.min(100, Math.round(100 * (1 - Math.exp(-dt / 6))));
+      const text = `FPS ${fps} | GPU ~${gpuLoad}%`;
+      if (overlayBox) overlayBox.textContent = text;
+
+      const diagLines = [
+        `GL OK: ${diag.glOK ? 'yes' : 'no'}`,
+        `Canvas(px): ${diag.canvasW}×${diag.canvasH}`,
+        `Workers: ${workerCount}`,
+        `RAF ticks: ${diag.rafTicks}`,
+        `Verts (seed): ${diag.verts}`,
+        `PointSize: ${diag.pointSize}`
+      ];
+      if (diagBox) diagBox.textContent = diagLines.join('\n');
+    }
+
+    function loop(ts){
+      const dt = ts - last; last = ts;
+      draw2D();
+      drawGL(ts);
+      updateOverlay(dt);
+      diag.rafTicks++;
+
+      rafId = requestAnimationFrame(loop);
+      setTimeout(() => { drawGL(ts + 0.5); }, 0);
+    }
+
+    function startAll(){
+      if (running) return;
+      running = true;
+      startCPU();
+      init2D();
+      initGL();
+      last = performance.now();
+      rafId = requestAnimationFrame(loop);
+    }
+
+    function stopAll(){
+      running = false;
+      stopCPU();
+      cancelAnimationFrame(rafId);
+    }
+
+    function setHiDPISize(el){
+      const base = window.devicePixelRatio || 1;
+      const dpr = Math.min(5, Math.max(2.5, base * 2)); // 안정 고해상도
+      el.width = Math.floor(window.innerWidth * dpr);
+      el.height = Math.floor(window.innerHeight * dpr);
+      diag.canvasW = el.width;
+      diag.canvasH = el.height;
+      el.style.width = "100%";
+      el.style.height = "100%";
+    }
+
+    document.addEventListener('DOMContentLoaded', () => {
+      c2d = document.getElementById('c2d');
+      glCanvas = document.getElementById('glCanvas');
+      diagBox = document.getElementById('diagBox');
+      overlayBox = document.getElementById('overlayBox');
+
+      function resize(){
+        setHiDPISize(c2d);
+        setHiDPISize(glCanvas);
+      }
+      resize();
+      window.addEventListener('resize', resize);
+
+      // IntersectionObserver로 “스크롤해서 내려갔을 때” 시작
+      setTimeout(() => {
+        const observer = new IntersectionObserver((entries) => {
+          entries.forEach(e => {
+            if (e.isIntersecting && !started){
+              started = true;
+              startAll();
+            }
+          });
+        }, { threshold: 0.2 });
+        if (glCanvas) observer.observe(glCanvas);
+      }, 200);
+
+      // 페이지 떠날 때 정리
+      window.addEventListener('beforeunload', () => {
+        stopAll();
+      });
+    });
+  </script>
+</body>
+</html>
