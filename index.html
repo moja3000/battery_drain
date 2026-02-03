@@ -13,18 +13,9 @@
       overflow: hidden;
       font-family: ui-monospace, system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
     }
-    .wrap {
-      position: fixed;
-      inset: 0;
-      background: #000;
-    }
-    canvas {
-      position: absolute;
-      inset: 0;
-      width: 100%;
-      height: 100%;
-      display: block;
-    }
+    .wrap { position: fixed; inset: 0; background: #000; }
+    canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+
     .hud {
       position: absolute;
       top: 12px;
@@ -49,12 +40,29 @@
       grid-template-columns: 120px 1fr 64px;
       gap: 10px;
       align-items: center;
+      margin-bottom: 8px;
     }
-    .row label {
-      font-size: 12px;
-      opacity: 0.95;
-    }
+    .row label { font-size: 12px; opacity: 0.95; }
     input[type="range"] { width: 100%; }
+
+    .row2 {
+      display: grid;
+      grid-template-columns: 120px 1fr 1fr;
+      gap: 10px;
+      align-items: center;
+      margin-top: 6px;
+    }
+    input[type="number"]{
+      width: 100%;
+      background: rgba(0,0,0,0.5);
+      border: 1px solid rgba(0,255,180,0.2);
+      color: rgba(0,255,180,0.95);
+      border-radius: 10px;
+      padding: 8px 10px;
+      font-size: 12px;
+      outline: none;
+    }
+
     .btns {
       display: flex;
       gap: 8px;
@@ -76,6 +84,7 @@
       line-height: 1.35;
       white-space: pre-line;
       opacity: 0.95;
+      margin-top: 10px;
     }
     .overlay {
       position: absolute;
@@ -105,9 +114,17 @@
           <div id="levelVal" style="text-align:right;font-size:12px;">70</div>
         </div>
 
+        <div class="row2">
+          <label>Timer (min)</label>
+          <input id="burnMin" type="number" min="1" step="1" value="60" />
+          <input id="restMin" type="number" min="0" step="1" value="60" />
+        </div>
+
         <div class="btns">
           <button id="toggle">Pause</button>
           <button id="apply">Apply</button>
+          <button id="sched">Scheduler: ON</button>
+          <button id="resetCycle">Reset Cycle</button>
           <button id="safe">Safe 40</button>
           <button id="hot">Hot 80</button>
           <button id="max">Max 100</button>
@@ -125,7 +142,12 @@
   // =======================
   // State
   // =======================
-  let running = true;
+  let running = true;          // 렌더/부하 동작 여부 (Pause/Resume)
+  let schedulerOn = true;      // 소모/휴식 스케줄러 동작 여부
+  let phase = "burn";          // "burn" | "rest"
+  let phaseEndsAt = 0;         // ms timestamp
+  let timerId = 0;             // setInterval id
+
   let fps = 0, last = 0, rafId = 0;
   let workerCount = 0;
 
@@ -134,7 +156,6 @@
     canvasW: 0,
     canvasH: 0,
     rafTicks: 0,
-    verts: 0,
     dpr: 1,
     shaderIters: 0,
     passes: 0,
@@ -145,10 +166,17 @@
   // UI
   const levelEl = document.getElementById('level');
   const levelVal = document.getElementById('levelVal');
+  const burnMinEl = document.getElementById('burnMin');
+  const restMinEl = document.getElementById('restMin');
+
   const diagEl = document.getElementById('diag');
   const overlayEl = document.getElementById('overlay');
+
   const toggleBtn = document.getElementById('toggle');
   const applyBtn = document.getElementById('apply');
+  const schedBtn = document.getElementById('sched');
+  const resetCycleBtn = document.getElementById('resetCycle');
+
   const safeBtn = document.getElementById('safe');
   const hotBtn  = document.getElementById('hot');
   const maxBtn  = document.getElementById('max');
@@ -171,30 +199,15 @@
   // =======================
   // Burn level -> parameters
   // =======================
-  // 목표: "너무 극단적으로 한 번에 폭주" 보다 "꾸준히 많이 소모"가 목적.
-  // level 0~100에 따라 아래를 조절:
-  // - dpr(내부 해상도)
-  // - shader iterations(프래그먼트 루프 횟수; 컴파일 필요)
-  // - passes(드로우 패스 반복)
-  // - workers(워커 수)
-  // - particles(2D 점 개수)
   function computeParams(level) {
     const baseDpr = window.devicePixelRatio || 1;
 
-    // 해상도: base*1.2 ~ base*2.2 (상한 5)
     const dpr = Math.min(5, Math.max(1.5, baseDpr * (1.2 + 1.0*(level/100))));
-
-    // 셰이더 반복: 250 ~ 1150 (너무 크면 iOS에서 빨리 스로틀/프레임 드랍 심해질 수 있음)
     const shaderIters = Math.round(250 + 900*(level/100));
-
-    // 패스: 2 ~ 10
     const passes = Math.round(2 + 8*(level/100));
 
-    // 워커: 코어수*0.5 ~ 코어수*1.6 (상한 12)
     const hw = Math.max(2, navigator.hardwareConcurrency || 6);
     const workersN = Math.min(12, Math.max(1, Math.round(hw * (0.5 + 1.1*(level/100)))));
-
-    // 2D 점: 600 ~ 3500
     const particlesN = Math.round(600 + 2900*(level/100));
 
     return { dpr, shaderIters, passes, workersN, particlesN };
@@ -207,7 +220,6 @@
     const code = `
       let stop=false;
       onmessage=(e)=>{ if(e.data==='stop') stop=true; };
-      // branch-light + transcendental heavy
       function f(x){ return Math.tan(Math.sin(x)*1.618) + Math.sqrt(Math.abs(x%131071)); }
       function spin(){
         let a=0.123456789, b=0.987654321, c=1.41421356237;
@@ -253,11 +265,9 @@
 
   function draw2D() {
     const w = c2d.width, h = c2d.height;
-    // 전체 덮기 (대역폭/Fill-rate)
     ctx.fillStyle = "rgb(0,0,0)";
     ctx.fillRect(0,0,w,h);
 
-    // 수천 점 그리기(거의 검정)
     ctx.globalAlpha = 0.04;
     ctx.fillStyle = "#020202";
     for (const p of particles) {
@@ -270,7 +280,7 @@
   }
 
   // =======================
-  // WebGL (fullscreen heavy shader)
+  // WebGL
   // =======================
   function compileShader(gl, src, type) {
     const s = gl.createShader(type);
@@ -283,7 +293,6 @@
   }
 
   function buildProgram(shaderIters) {
-    // GL context init (once)
     if (!gl) {
       gl = glc.getContext("webgl2", { antialias:true, powerPreference:"high-performance", alpha:false })
         || glc.getContext("webgl",  { antialias:true, alpha:false });
@@ -295,7 +304,6 @@
       isGL2 = !!gl.drawArraysInstanced;
     }
 
-    // Destroy old program if any
     if (prog) {
       try { gl.deleteProgram(prog); } catch(e){}
       prog = null;
@@ -325,7 +333,6 @@
             n(gl_FragCoord.yy+ t)
           )));
         }
-        // 출력은 항상 검정 (화면은 까맣지만 연산은 수행)
         C = vec4(0.0,0.0,0.0,1.0);
       }`;
 
@@ -368,7 +375,6 @@
       return false;
     }
 
-    // quad buffer (create once)
     if (!vbo) {
       const quad = new Float32Array([-1,-1,  1,-1,  -1,1,   -1,1,  1,-1,  1,1]);
       vbo = gl.createBuffer();
@@ -392,23 +398,19 @@
 
     gl.useProgram(prog);
 
-    // attrib
     gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
     const loc = gl.getAttribLocation(prog, "p");
     gl.enableVertexAttribArray(loc);
     gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
 
-    // uniform
     const uT = gl.getUniformLocation(prog, "uT");
     gl.uniform1f(uT, t);
 
-    for (let k=0; k<passes; k++) {
-      gl.drawArrays(gl.TRIANGLES, 0, 6);
-    }
+    for (let k=0; k<passes; k++) gl.drawArrays(gl.TRIANGLES, 0, 6);
   }
 
   // =======================
-  // Resize / Apply settings
+  // Apply settings (level)
   // =======================
   let current = computeParams(+levelEl.value);
 
@@ -428,35 +430,83 @@
 
   function applyLevel(level) {
     current = computeParams(level);
-
-    // Resize (pixel count)
     setHiDPISize(current.dpr);
-
-    // Re-init 2D particles
     init2D(current.particlesN);
-
-    // Rebuild GL program (shader iters are compile-time)
     buildProgram(current.shaderIters);
 
-    // Restart CPU workers
-    startCPU(current.workersN);
+    // burn 상태일 때만 워커 동작 (휴식 중엔 stopCPU)
+    if (phase === "burn") startCPU(current.workersN);
 
     diag.passes = current.passes;
-
-    renderDiag(0);
+    renderDiag(16);
   }
 
   // =======================
-  // Loop
+  // Timer (Burn/Rest cycle)
+  // =======================
+  function minsToMs(m) { return Math.max(0, Math.floor(m)) * 60 * 1000; }
+
+  function scheduleNextPhase(nextPhase) {
+    phase = nextPhase;
+
+    const burnMs = minsToMs(+burnMinEl.value || 0);
+    const restMs = minsToMs(+restMinEl.value || 0);
+
+    // 0분 입력 같은 극단 케이스 방지: burn은 최소 1분 권장
+    const duration = (phase === "burn") ? (burnMs || 60*1000) : restMs;
+
+    phaseEndsAt = Date.now() + duration;
+
+    if (phase === "burn") {
+      // 부하 켜기
+      startCPU(current.workersN);
+      running = true;
+      toggleBtn.textContent = "Pause";
+    } else {
+      // 휴식: CPU 워커까지 끔, 렌더도 끔 (진짜 휴식)
+      stopCPU();
+      running = false;
+      toggleBtn.textContent = "Resume";
+    }
+  }
+
+  function resetCycle() {
+    scheduleNextPhase("burn");
+  }
+
+  function tickScheduler() {
+    if (!schedulerOn) return;
+
+    const now = Date.now();
+    if (phaseEndsAt <= 0) return;
+
+    if (now >= phaseEndsAt) {
+      scheduleNextPhase(phase === "burn" ? "rest" : "burn");
+    }
+  }
+
+  function formatRemain(ms) {
+    const s = Math.max(0, Math.floor(ms/1000));
+    const mm = Math.floor(s/60);
+    const ss = s % 60;
+    return `${mm}m ${String(ss).padStart(2,'0')}s`;
+  }
+
+  // =======================
+  // Loop & HUD
   // =======================
   function renderDiag(dt) {
-    // fps
     fps = Math.max(1, Math.round(1000/Math.max(1, dt || 16)));
     const gpuEst = Math.min(100, Math.round(100 * (1 - Math.exp(-(dt||16) / 6))));
-    overlayEl.textContent = `FPS ${fps} | GPU~${gpuEst}% | Level ${levelEl.value}`;
+
+    const remain = phaseEndsAt ? formatRemain(phaseEndsAt - Date.now()) : "--";
+    const phaseText = schedulerOn ? `${phase.toUpperCase()} (${remain})` : "MANUAL";
+
+    overlayEl.textContent = `Phase ${phaseText} | FPS ${fps} | GPU~${gpuEst}% | Level ${levelEl.value}`;
 
     diagEl.textContent =
 `GL OK: ${diag.glOK ? "yes" : "no"}
+Phase: ${phaseText}
 Canvas(px): ${diag.canvasW}×${diag.canvasH} (dpr≈${diag.dpr.toFixed(2)})
 Workers: ${workerCount}
 2D particles: ${diag.particles}
@@ -471,10 +521,15 @@ RAF ticks: ${diag.rafTicks}`;
     if (running) {
       draw2D();
       drawGL(ts, current.passes);
-      // "꾸준히" 소모를 늘리기 위한 추가 draw (너무 과하면 스로틀 유발)
-      setTimeout(() => { if (running) drawGL(ts + 0.5, Math.max(1, Math.floor(current.passes*0.6))); }, 0);
+      setTimeout(() => {
+        if (running) drawGL(ts + 0.5, Math.max(1, Math.floor(current.passes*0.6)));
+      }, 0);
+
       diag.rafTicks++;
       renderDiag(dt);
+    } else {
+      // 휴식/정지 중에도 HUD는 갱신
+      renderDiag(16);
     }
 
     rafId = requestAnimationFrame(loop);
@@ -483,52 +538,86 @@ RAF ticks: ${diag.rafTicks}`;
   // =======================
   // UI handlers
   // =======================
-  levelEl.addEventListener('input', () => {
-    levelVal.textContent = levelEl.value;
-  });
+  levelEl.addEventListener('input', () => { levelVal.textContent = levelEl.value; });
 
   applyBtn.addEventListener('click', () => {
+    // 레벨 파라미터만 반영. 스케줄 phase는 유지.
     applyLevel(+levelEl.value);
   });
 
   safeBtn.addEventListener('click', () => {
-    levelEl.value = 40; levelVal.textContent = "40";
-    applyLevel(40);
+    levelEl.value = 40; levelVal.textContent = "40"; applyLevel(40);
   });
   hotBtn.addEventListener('click', () => {
-    levelEl.value = 80; levelVal.textContent = "80";
-    applyLevel(80);
+    levelEl.value = 80; levelVal.textContent = "80"; applyLevel(80);
   });
   maxBtn.addEventListener('click', () => {
-    levelEl.value = 100; levelVal.textContent = "100";
-    applyLevel(100);
+    levelEl.value = 100; levelVal.textContent = "100"; applyLevel(100);
   });
 
   toggleBtn.addEventListener('click', () => {
-    running = !running;
-    toggleBtn.textContent = running ? "Pause" : "Resume";
-    if (!running) {
-      overlayEl.textContent = "paused";
+    // Pause는 즉시 부하를 멈추고(워커도 멈춤), Resume은 burn일 때만 재시작
+    if (running) {
+      running = false;
+      stopCPU();
+      toggleBtn.textContent = "Resume";
     } else {
+      // 휴식 phase라면 Resume 눌러도 "휴식 정책"이 우선.
+      if (schedulerOn && phase === "rest") return;
+      running = true;
+      startCPU(current.workersN);
+      toggleBtn.textContent = "Pause";
       last = performance.now();
     }
   });
 
+  schedBtn.addEventListener('click', () => {
+    schedulerOn = !schedulerOn;
+    schedBtn.textContent = `Scheduler: ${schedulerOn ? "ON" : "OFF"}`;
+
+    if (schedulerOn) {
+      // 다시 켜면 현재 설정으로 burn부터 재시작
+      resetCycle();
+    } else {
+      // 끄면 MANUAL 모드: 현재 running 상태 유지(사용자가 Pause/Resume로 제어)
+      phaseEndsAt = 0;
+      phase = "burn";
+    }
+  });
+
+  resetCycleBtn.addEventListener('click', () => {
+    resetCycle();
+  });
+
+  // Timer 값 바꾸면 다음 사이클부터 반영되게 두었고,
+  // 즉시 반영하고 싶으면 Reset Cycle 버튼을 누르면 됨.
+
   window.addEventListener('resize', () => {
-    // resize 시 현재 레벨 기준으로 재적용(해상도/파티클/프로그램 유지)
     applyLevel(+levelEl.value);
   });
 
   window.addEventListener('beforeunload', () => {
     try { cancelAnimationFrame(rafId); } catch(e){}
+    try { clearInterval(timerId); } catch(e){}
     stopCPU();
   });
 
   // =======================
-  // Start immediately on first load
+  // Start immediately
   // =======================
   levelVal.textContent = levelEl.value;
-  applyLevel(+levelEl.value);     // ✅ 첫 화면부터 바로 시작
+
+  // 초기 적용
+  applyLevel(+levelEl.value);
+
+  // 스케줄러 시작: 첫 로드부터 바로 "소모(BURN)" 시작
+  resetCycle();
+
+  // scheduler tick (1초마다)
+  timerId = setInterval(() => {
+    tickScheduler();
+  }, 1000);
+
   last = performance.now();
   rafId = requestAnimationFrame(loop);
 })();
