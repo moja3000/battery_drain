@@ -1,0 +1,353 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <title>iPad Burner (BURN)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <style>
+    html, body { margin:0; padding:0; background:#000; height:100%; overflow:hidden;
+      font-family: ui-monospace, system-ui, -apple-system, BlinkMacSystemFont, sans-serif; }
+    .wrap{ position:fixed; inset:0; background:#000; }
+    canvas{ position:absolute; inset:0; width:100%; height:100%; display:block; }
+    .hud{ position:absolute; top:12px; left:12px; right:12px; display:grid; gap:10px; pointer-events:none; }
+    .panel{ pointer-events:auto; background:rgba(0,0,0,0.65); border:1px solid rgba(0,255,180,0.15);
+      border-radius:12px; padding:10px 12px; color:rgba(0,255,180,0.9); box-shadow:0 6px 20px rgba(0,0,0,0.35); }
+    .row{ display:grid; grid-template-columns:120px 1fr 64px; gap:10px; align-items:center; margin-bottom:8px; }
+    .row label{ font-size:12px; opacity:0.95; }
+    input[type="range"]{ width:100%; }
+    .btns{ display:flex; gap:8px; flex-wrap:wrap; margin-top:8px; }
+    button{ appearance:none; border:1px solid rgba(0,255,180,0.25); background:rgba(0,0,0,0.55);
+      color:rgba(0,255,180,0.92); padding:8px 10px; border-radius:10px; font-size:12px; }
+    button:active{ transform: translateY(1px); }
+    .diag{ font-size:12px; line-height:1.35; white-space:pre-line; opacity:0.95; margin-top:10px; }
+    .overlay{ position:absolute; bottom:12px; right:12px; pointer-events:none; background:rgba(0,0,0,0.45);
+      border:1px solid rgba(0,255,180,0.12); color:rgba(0,255,180,0.9); padding:8px 10px; border-radius:10px;
+      font-size:12px; font-family: ui-monospace, monospace; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <canvas id="c2d"></canvas>
+    <canvas id="glc"></canvas>
+
+    <div class="hud">
+      <div class="panel">
+        <div class="row">
+          <label>Burn Level</label>
+          <input id="level" type="range" min="0" max="100" value="80" />
+          <div id="levelVal" style="text-align:right;font-size:12px;">80</div>
+        </div>
+
+        <div class="btns">
+          <button id="toggle">Pause</button>
+          <button id="apply">Apply</button>
+          <button id="safe">Safe 40</button>
+          <button id="hot">Hot 80</button>
+          <button id="max">Max 100</button>
+          <button id="goRest">Open REST</button>
+        </div>
+
+        <div class="diag" id="diag"></div>
+      </div>
+    </div>
+
+    <div class="overlay" id="overlay">BURN starting…</div>
+  </div>
+
+<script>
+(() => {
+  let running = true;
+  let fps = 0, last = 0, rafId = 0;
+  let workerCount = 0;
+
+  const diag = { glOK:false, canvasW:0, canvasH:0, rafTicks:0, dpr:1, shaderIters:0, passes:0, particles:0, workers:0 };
+
+  const levelEl = document.getElementById('level');
+  const levelVal = document.getElementById('levelVal');
+  const diagEl = document.getElementById('diag');
+  const overlayEl = document.getElementById('overlay');
+
+  const toggleBtn = document.getElementById('toggle');
+  const applyBtn = document.getElementById('apply');
+  const safeBtn = document.getElementById('safe');
+  const hotBtn  = document.getElementById('hot');
+  const maxBtn  = document.getElementById('max');
+  const goRestBtn = document.getElementById('goRest');
+
+  const c2d = document.getElementById('c2d');
+  const glc = document.getElementById('glc');
+  let ctx;
+
+  let workers = [];
+  let gl, prog, vbo;
+  let isGL2 = false;
+  let particles = [];
+
+  function computeParams(level) {
+    const baseDpr = window.devicePixelRatio || 1;
+    const dpr = Math.min(5, Math.max(1.5, baseDpr * (1.2 + 1.0*(level/100))));
+    const shaderIters = Math.round(250 + 900*(level/100));
+    const passes = Math.round(2 + 8*(level/100));
+    const hw = Math.max(2, navigator.hardwareConcurrency || 6);
+    const workersN = Math.min(12, Math.max(1, Math.round(hw * (0.5 + 1.1*(level/100)))));
+    const particlesN = Math.round(600 + 2900*(level/100));
+    return { dpr, shaderIters, passes, workersN, particlesN };
+  }
+
+  function makeWorker() {
+    const code = `
+      let stop=false;
+      onmessage=(e)=>{ if(e.data==='stop') stop=true; };
+      function f(x){ return Math.tan(Math.sin(x)*1.618) + Math.sqrt(Math.abs(x%131071)); }
+      function spin(){
+        let a=0.123456789, b=0.987654321, c=1.41421356237;
+        while(!stop){
+          for(let i=0;i<8e6;i++){
+            a = f(b*c + i*0.000001);
+            b = f(a*c + i*0.000002);
+            c = f(a*b + i*0.000003);
+          }
+        }
+      }
+      spin();
+    `;
+    return new Worker(URL.createObjectURL(new Blob([code], { type: "application/javascript" })));
+  }
+
+  function startCPU(n) {
+    stopCPU();
+    for (let i=0;i<n;i++) workers.push(makeWorker());
+    workerCount = workers.length;
+    diag.workers = workerCount;
+  }
+
+  function stopCPU() {
+    for (const w of workers) { try { w.postMessage('stop'); w.terminate(); } catch(e){} }
+    workers = [];
+    workerCount = 0;
+    diag.workers = 0;
+  }
+
+  function init2D(particlesN) {
+    ctx = c2d.getContext('2d', { alpha: false });
+    const w = c2d.width, h = c2d.height;
+    particles = Array.from({length: particlesN}, () => ({
+      x: Math.random()*w, y: Math.random()*h,
+      vx: (Math.random()-0.5)*2.0, vy: (Math.random()-0.5)*2.0
+    }));
+    diag.particles = particlesN;
+  }
+
+  function draw2D() {
+    const w = c2d.width, h = c2d.height;
+    ctx.fillStyle = "rgb(0,0,0)";
+    ctx.fillRect(0,0,w,h);
+
+    ctx.globalAlpha = 0.04;
+    ctx.fillStyle = "#020202";
+    for (const p of particles) {
+      p.x += p.vx; p.y += p.vy;
+      if (p.x<0 || p.x>w) p.vx *= -1;
+      if (p.y<0 || p.y>h) p.vy *= -1;
+      ctx.fillRect(p.x, p.y, 2, 2);
+    }
+    ctx.globalAlpha = 1.0;
+  }
+
+  function compileShader(gl, src, type) {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) console.error(gl.getShaderInfoLog(s));
+    return s;
+  }
+
+  function buildProgram(shaderIters) {
+    if (!gl) {
+      gl = glc.getContext("webgl2", { antialias:true, powerPreference:"high-performance", alpha:false })
+        || glc.getContext("webgl",  { antialias:true, alpha:false });
+      if (!gl) { diag.glOK = false; return false; }
+      isGL2 = !!gl.drawArraysInstanced;
+    }
+
+    if (prog) { try { gl.deleteProgram(prog); } catch(e){} prog = null; }
+
+    const vertGL2 = `#version 300 es
+      in vec2 p; void main(){ gl_Position = vec4(p,0.0,1.0); }`;
+
+    const fragGL2 = `#version 300 es
+      precision highp float;
+      uniform float uT;
+      out vec4 C;
+      float h(vec2 p){ return fract(sin(dot(p, vec2(12.9898,78.233))) * 43758.5453); }
+      float n(vec2 p){
+        float s=0.0, a=0.5;
+        for(int i=0;i<9;i++){ s += h(p)*a; p*=2.03; a*=0.5; }
+        return s;
+      }
+      void main(){
+        vec3 col = vec3(0.1);
+        for (int i=0; i<${shaderIters}; i++){
+          float t = uT*0.0008 + float(i)*0.03125;
+          col = abs(cos(col*t + vec3(
+            n(gl_FragCoord.xy+t),
+            n(gl_FragCoord.yx-t),
+            n(gl_FragCoord.yy+ t)
+          )));
+        }
+        C = vec4(0.0,0.0,0.0,1.0);
+      }`;
+
+    const vertGL1 = `attribute vec2 p; void main(){ gl_Position = vec4(p,0.0,1.0); }`;
+
+    const fragGL1 = `
+      precision highp float;
+      uniform float uT;
+      float h(vec2 p){ return fract(sin(dot(p, vec2(12.9898,78.233))) * 43758.5453); }
+      float n(vec2 p){
+        float s=0.0, a=0.5;
+        for(int i=0;i<7;i++){ s += h(p)*a; p*=2.03; a*=0.5; }
+        return s;
+      }
+      void main(){
+        vec3 col = vec3(0.1);
+        for (int i=0; i<${Math.max(200, Math.round(shaderIters*0.83))}; i++){
+          float t = uT*0.0008 + float(i)*0.03125;
+          col = abs(cos(col*t + vec3(
+            n(gl_FragCoord.xy+t),
+            n(gl_FragCoord.yx-t),
+            n(gl_FragCoord.yy+ t)
+          )));
+        }
+        gl_FragColor = vec4(0.0,0.0,0.0,1.0);
+      }`;
+
+    const vs = compileShader(gl, isGL2 ? vertGL2 : vertGL1, gl.VERTEX_SHADER);
+    const fs = compileShader(gl, isGL2 ? fragGL2 : fragGL1, gl.FRAGMENT_SHADER);
+
+    prog = gl.createProgram();
+    gl.attachShader(prog, vs);
+    gl.attachShader(prog, fs);
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) { console.error(gl.getProgramInfoLog(prog)); diag.glOK = false; return false; }
+
+    if (!vbo) {
+      const quad = new Float32Array([-1,-1,  1,-1,  -1,1,   -1,1,  1,-1,  1,1]);
+      vbo = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+      gl.bufferData(gl.ARRAY_BUFFER, quad, gl.STATIC_DRAW);
+    }
+
+    diag.glOK = true;
+    diag.shaderIters = shaderIters;
+    return true;
+  }
+
+  function drawGL(t, passes) {
+    if (!gl || !prog) return;
+    const w = glc.width, h = glc.height;
+    gl.viewport(0,0,w,h);
+    gl.enable(gl.DEPTH_TEST);
+    gl.clearColor(0,0,0,1);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+    gl.useProgram(prog);
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+    const loc = gl.getAttribLocation(prog, "p");
+    gl.enableVertexAttribArray(loc);
+    gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+
+    const uT = gl.getUniformLocation(prog, "uT");
+    gl.uniform1f(uT, t);
+
+    for (let k=0; k<passes; k++) gl.drawArrays(gl.TRIANGLES, 0, 6);
+  }
+
+  let current = computeParams(+levelEl.value);
+
+  function setHiDPISize(dpr) {
+    const W = window.innerWidth;
+    const H = window.innerHeight;
+    const ww = Math.floor(W * dpr);
+    const hh = Math.floor(H * dpr);
+    c2d.width = ww; c2d.height = hh;
+    glc.width = ww; glc.height = hh;
+    diag.canvasW = ww; diag.canvasH = hh; diag.dpr = dpr;
+  }
+
+  function applyLevel(level) {
+    current = computeParams(level);
+    setHiDPISize(current.dpr);
+    init2D(current.particlesN);
+    buildProgram(current.shaderIters);
+
+    if (running) startCPU(current.workersN);
+    diag.passes = current.passes;
+    renderDiag(16);
+  }
+
+  function renderDiag(dt) {
+    fps = Math.max(1, Math.round(1000/Math.max(1, dt || 16)));
+    const gpuEst = Math.min(100, Math.round(100 * (1 - Math.exp(-(dt||16) / 6))));
+    overlayEl.textContent = `BURN | ${running ? "RUN" : "PAUSE"} | FPS ${fps} | GPU~${gpuEst}% | Level ${levelEl.value}`;
+    diagEl.textContent =
+`GL OK: ${diag.glOK ? "yes" : "no"}
+Mode: burn.html
+Running: ${running ? "yes" : "no"}
+Canvas(px): ${diag.canvasW}×${diag.canvasH} (dpr≈${diag.dpr.toFixed(2)})
+Workers: ${workerCount}
+2D particles: ${diag.particles}
+Shader iters: ${diag.shaderIters}
+GL passes/frame: ${diag.passes}
+RAF ticks: ${diag.rafTicks}`;
+  }
+
+  function loop(ts) {
+    const dt = ts - last; last = ts;
+
+    if (running) {
+      draw2D();
+      drawGL(ts, current.passes);
+      setTimeout(() => {
+        if (running) drawGL(ts + 0.5, Math.max(1, Math.floor(current.passes*0.6)));
+      }, 0);
+      diag.rafTicks++;
+    } else {
+      // pause: 화면 최소 유지
+      draw2D();
+      drawGL(ts, 1);
+    }
+
+    renderDiag(dt);
+    rafId = requestAnimationFrame(loop);
+  }
+
+  levelEl.addEventListener('input', () => { levelVal.textContent = levelEl.value; });
+  applyBtn.addEventListener('click', () => applyLevel(+levelEl.value));
+
+  safeBtn.addEventListener('click', () => { levelEl.value = 40; levelVal.textContent = "40"; applyLevel(40); });
+  hotBtn.addEventListener('click',  () => { levelEl.value = 80; levelVal.textContent = "80"; applyLevel(80); });
+  maxBtn.addEventListener('click',  () => { levelEl.value = 100; levelVal.textContent = "100"; applyLevel(100); });
+
+  toggleBtn.addEventListener('click', () => {
+    running = !running;
+    if (!running) { stopCPU(); toggleBtn.textContent = "Resume"; }
+    else { startCPU(current.workersN); toggleBtn.textContent = "Pause"; last = performance.now(); }
+  });
+
+  goRestBtn.addEventListener('click', () => { location.href = "./rest.html"; });
+
+  window.addEventListener('resize', () => applyLevel(+levelEl.value));
+  window.addEventListener('beforeunload', () => { try { cancelAnimationFrame(rafId); } catch(e){} stopCPU(); });
+
+  // Start
+  levelVal.textContent = levelEl.value;
+  applyLevel(+levelEl.value);
+
+  last = performance.now();
+  rafId = requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
