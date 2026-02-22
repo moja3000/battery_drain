@@ -2,7 +2,7 @@
 <html lang="ko">
 <head>
   <meta charset="utf-8" />
-  <title>iPad Battery Burner</title>
+  <title>iPad Battery Burner (mode=burn/rest)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
   <style>
     html, body {
@@ -45,24 +45,6 @@
     .row label { font-size: 12px; opacity: 0.95; }
     input[type="range"] { width: 100%; }
 
-    .row2 {
-      display: grid;
-      grid-template-columns: 120px 1fr 1fr;
-      gap: 10px;
-      align-items: center;
-      margin-top: 6px;
-    }
-    input[type="number"]{
-      width: 100%;
-      background: rgba(0,0,0,0.5);
-      border: 1px solid rgba(0,255,180,0.2);
-      color: rgba(0,255,180,0.95);
-      border-radius: 10px;
-      padding: 8px 10px;
-      font-size: 12px;
-      outline: none;
-    }
-
     .btns {
       display: flex;
       gap: 8px;
@@ -79,6 +61,7 @@
       font-size: 12px;
     }
     button:active { transform: translateY(1px); }
+
     .diag {
       font-size: 12px;
       line-height: 1.35;
@@ -98,6 +81,21 @@
       border-radius: 10px;
       font-size: 12px;
       font-family: ui-monospace, monospace;
+      max-width: 92vw;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .hint {
+      margin-top: 8px;
+      font-size: 12px;
+      opacity: 0.9;
+      line-height: 1.35;
+      white-space: pre-line;
+    }
+    .hint code {
+      font-family: ui-monospace, monospace;
+      opacity: 0.95;
     }
   </style>
 </head>
@@ -114,20 +112,22 @@
           <div id="levelVal" style="text-align:right;font-size:12px;">70</div>
         </div>
 
-        <div class="row2">
-          <label>Timer (min)</label>
-          <input id="burnMin" type="number" min="1" step="1" value="60" />
-          <input id="restMin" type="number" min="0" step="1" value="60" />
-        </div>
-
         <div class="btns">
           <button id="toggle">Pause</button>
           <button id="apply">Apply</button>
-          <button id="sched">Scheduler: ON</button>
-          <button id="resetCycle">Reset Cycle</button>
           <button id="safe">Safe 40</button>
           <button id="hot">Hot 80</button>
           <button id="max">Max 100</button>
+          <button id="goBurn">Go BURN</button>
+          <button id="goRest">Go REST</button>
+        </div>
+
+        <div class="hint" id="hint">
+URL로 모드 제어:
+- burn: <code>/?mode=burn</code>
+- rest: <code>/?mode=rest</code>
+
+단축어(Shortcuts)에서 충전/배터리 상태에 따라 위 URL을 열도록 자동화하면 끝.
         </div>
 
         <div class="diag" id="diag"></div>
@@ -143,10 +143,7 @@
   // State
   // =======================
   let running = true;          // 렌더/부하 동작 여부 (Pause/Resume)
-  let schedulerOn = true;      // 소모/휴식 스케줄러 동작 여부
-  let phase = "burn";          // "burn" | "rest"
-  let phaseEndsAt = 0;         // ms timestamp
-  let timerId = 0;             // setInterval id
+  let mode = "burn";           // "burn" | "rest"
 
   let fps = 0, last = 0, rafId = 0;
   let workerCount = 0;
@@ -166,20 +163,19 @@
   // UI
   const levelEl = document.getElementById('level');
   const levelVal = document.getElementById('levelVal');
-  const burnMinEl = document.getElementById('burnMin');
-  const restMinEl = document.getElementById('restMin');
 
   const diagEl = document.getElementById('diag');
   const overlayEl = document.getElementById('overlay');
 
   const toggleBtn = document.getElementById('toggle');
   const applyBtn = document.getElementById('apply');
-  const schedBtn = document.getElementById('sched');
-  const resetCycleBtn = document.getElementById('resetCycle');
 
   const safeBtn = document.getElementById('safe');
   const hotBtn  = document.getElementById('hot');
   const maxBtn  = document.getElementById('max');
+
+  const goBurnBtn = document.getElementById('goBurn');
+  const goRestBtn = document.getElementById('goRest');
 
   // Canvases
   const c2d = document.getElementById('c2d');
@@ -434,79 +430,62 @@
     init2D(current.particlesN);
     buildProgram(current.shaderIters);
 
-    // burn 상태일 때만 워커 동작 (휴식 중엔 stopCPU)
-    if (phase === "burn") startCPU(current.workersN);
+    // mode에 따라 CPU 워커 on/off
+    if (mode === "burn" && running) startCPU(current.workersN);
+    else stopCPU();
 
     diag.passes = current.passes;
     renderDiag(16);
   }
 
   // =======================
-  // Timer (Burn/Rest cycle)
+  // Mode from URL / storage
   // =======================
-  function minsToMs(m) { return Math.max(0, Math.floor(m)) * 60 * 1000; }
+  function getModeFromUrlOrStorage() {
+    const u = new URL(location.href);
+    const m = u.searchParams.get("mode");
+    if (m === "burn" || m === "rest") {
+      localStorage.setItem("burn_mode", m);
+      return m;
+    }
+    return localStorage.getItem("burn_mode") || "burn";
+  }
 
-  function scheduleNextPhase(nextPhase) {
-    phase = nextPhase;
+  function applyMode(m) {
+    mode = m;
 
-    const burnMs = minsToMs(+burnMinEl.value || 0);
-    const restMs = minsToMs(+restMinEl.value || 0);
-
-    // 0분 입력 같은 극단 케이스 방지: burn은 최소 1분 권장
-    const duration = (phase === "burn") ? (burnMs || 60*1000) : restMs;
-
-    phaseEndsAt = Date.now() + duration;
-
-    if (phase === "burn") {
-      // 부하 켜기
-      startCPU(current.workersN);
+    if (mode === "burn") {
       running = true;
+      startCPU(current.workersN);
       toggleBtn.textContent = "Pause";
     } else {
-      // 휴식: CPU 워커까지 끔, 렌더도 끔 (진짜 휴식)
-      stopCPU();
+      // rest
       running = false;
+      stopCPU();
       toggleBtn.textContent = "Resume";
     }
   }
 
-  function resetCycle() {
-    scheduleNextPhase("burn");
-  }
-
-  function tickScheduler() {
-    if (!schedulerOn) return;
-
-    const now = Date.now();
-    if (phaseEndsAt <= 0) return;
-
-    if (now >= phaseEndsAt) {
-      scheduleNextPhase(phase === "burn" ? "rest" : "burn");
+  // 다시 포그라운드로 돌아오면 URL 기준으로 재적용
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) {
+      applyMode(getModeFromUrlOrStorage());
+      renderDiag(16);
     }
-  }
-
-  function formatRemain(ms) {
-    const s = Math.max(0, Math.floor(ms/1000));
-    const mm = Math.floor(s/60);
-    const ss = s % 60;
-    return `${mm}m ${String(ss).padStart(2,'0')}s`;
-  }
+  });
 
   // =======================
-  // Loop & HUD
+  // HUD
   // =======================
   function renderDiag(dt) {
     fps = Math.max(1, Math.round(1000/Math.max(1, dt || 16)));
     const gpuEst = Math.min(100, Math.round(100 * (1 - Math.exp(-(dt||16) / 6))));
-
-    const remain = phaseEndsAt ? formatRemain(phaseEndsAt - Date.now()) : "--";
-    const phaseText = schedulerOn ? `${phase.toUpperCase()} (${remain})` : "MANUAL";
-
-    overlayEl.textContent = `Phase ${phaseText} | FPS ${fps} | GPU~${gpuEst}% | Level ${levelEl.value}`;
+    overlayEl.textContent = `Mode ${mode.toUpperCase()} | ${running ? "RUN" : "REST"} | FPS ${fps} | GPU~${gpuEst}% | Level ${levelEl.value}`;
 
     diagEl.textContent =
 `GL OK: ${diag.glOK ? "yes" : "no"}
-Phase: ${phaseText}
+Mode: ${mode}
+Running: ${running ? "yes" : "no"}
 Canvas(px): ${diag.canvasW}×${diag.canvasH} (dpr≈${diag.dpr.toFixed(2)})
 Workers: ${workerCount}
 2D particles: ${diag.particles}
@@ -518,20 +497,22 @@ RAF ticks: ${diag.rafTicks}`;
   function loop(ts) {
     const dt = ts - last; last = ts;
 
-    if (running) {
+    if (running && mode === "burn") {
+      // burn: 강하게
       draw2D();
       drawGL(ts, current.passes);
       setTimeout(() => {
-        if (running) drawGL(ts + 0.5, Math.max(1, Math.floor(current.passes*0.6)));
+        if (running && mode === "burn") drawGL(ts + 0.5, Math.max(1, Math.floor(current.passes*0.6)));
       }, 0);
-
       diag.rafTicks++;
-      renderDiag(dt);
     } else {
-      // 휴식/정지 중에도 HUD는 갱신
-      renderDiag(16);
+      // rest: 화면은 "살아있게" 최소 렌더(부하 최소)
+      // (완전 정지하면 화면이 멈춘 것처럼 보여서)
+      draw2D();
+      drawGL(ts, 1);
     }
 
+    renderDiag(dt);
     rafId = requestAnimationFrame(loop);
   }
 
@@ -540,30 +521,20 @@ RAF ticks: ${diag.rafTicks}`;
   // =======================
   levelEl.addEventListener('input', () => { levelVal.textContent = levelEl.value; });
 
-  applyBtn.addEventListener('click', () => {
-    // 레벨 파라미터만 반영. 스케줄 phase는 유지.
-    applyLevel(+levelEl.value);
-  });
+  applyBtn.addEventListener('click', () => applyLevel(+levelEl.value));
 
-  safeBtn.addEventListener('click', () => {
-    levelEl.value = 40; levelVal.textContent = "40"; applyLevel(40);
-  });
-  hotBtn.addEventListener('click', () => {
-    levelEl.value = 80; levelVal.textContent = "80"; applyLevel(80);
-  });
-  maxBtn.addEventListener('click', () => {
-    levelEl.value = 100; levelVal.textContent = "100"; applyLevel(100);
-  });
+  safeBtn.addEventListener('click', () => { levelEl.value = 40; levelVal.textContent = "40"; applyLevel(40); });
+  hotBtn.addEventListener('click',  () => { levelEl.value = 80; levelVal.textContent = "80"; applyLevel(80); });
+  maxBtn.addEventListener('click',  () => { levelEl.value = 100; levelVal.textContent = "100"; applyLevel(100); });
 
   toggleBtn.addEventListener('click', () => {
-    // Pause는 즉시 부하를 멈추고(워커도 멈춤), Resume은 burn일 때만 재시작
+    // 수동 Pause/Resume (현재 mode가 rest면 Resume 해도 rest 정책 유지)
     if (running) {
       running = false;
       stopCPU();
       toggleBtn.textContent = "Resume";
     } else {
-      // 휴식 phase라면 Resume 눌러도 "휴식 정책"이 우선.
-      if (schedulerOn && phase === "rest") return;
+      if (mode === "rest") return; // rest일 때는 수동 resume 금지(정책 유지)
       running = true;
       startCPU(current.workersN);
       toggleBtn.textContent = "Pause";
@@ -571,52 +542,29 @@ RAF ticks: ${diag.rafTicks}`;
     }
   });
 
-  schedBtn.addEventListener('click', () => {
-    schedulerOn = !schedulerOn;
-    schedBtn.textContent = `Scheduler: ${schedulerOn ? "ON" : "OFF"}`;
+  function navigateMode(m) {
+    const u = new URL(location.href);
+    u.searchParams.set("mode", m);
+    location.href = u.toString();
+  }
+  goBurnBtn.addEventListener('click', () => navigateMode("burn"));
+  goRestBtn.addEventListener('click', () => navigateMode("rest"));
 
-    if (schedulerOn) {
-      // 다시 켜면 현재 설정으로 burn부터 재시작
-      resetCycle();
-    } else {
-      // 끄면 MANUAL 모드: 현재 running 상태 유지(사용자가 Pause/Resume로 제어)
-      phaseEndsAt = 0;
-      phase = "burn";
-    }
-  });
-
-  resetCycleBtn.addEventListener('click', () => {
-    resetCycle();
-  });
-
-  // Timer 값 바꾸면 다음 사이클부터 반영되게 두었고,
-  // 즉시 반영하고 싶으면 Reset Cycle 버튼을 누르면 됨.
-
-  window.addEventListener('resize', () => {
-    applyLevel(+levelEl.value);
-  });
+  window.addEventListener('resize', () => applyLevel(+levelEl.value));
 
   window.addEventListener('beforeunload', () => {
     try { cancelAnimationFrame(rafId); } catch(e){}
-    try { clearInterval(timerId); } catch(e){}
     stopCPU();
   });
 
   // =======================
-  // Start immediately
+  // Start
   // =======================
   levelVal.textContent = levelEl.value;
 
-  // 초기 적용
+  mode = getModeFromUrlOrStorage();
+  applyMode(mode);
   applyLevel(+levelEl.value);
-
-  // 스케줄러 시작: 첫 로드부터 바로 "소모(BURN)" 시작
-  resetCycle();
-
-  // scheduler tick (1초마다)
-  timerId = setInterval(() => {
-    tickScheduler();
-  }, 1000);
 
   last = performance.now();
   rafId = requestAnimationFrame(loop);
